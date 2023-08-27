@@ -2,6 +2,7 @@ import logging
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
 from flask_pymongo import PyMongo
+from pymongo import errors
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
@@ -35,6 +36,9 @@ app.config.update(
 mail = Mail(app)
 mongo = PyMongo(app)
 
+mongo.db.users.create_index("username", unique=True)
+mongo.db.users.create_index("email", unique=True)
+
 
 # Email validation function
 def is_valid_email(email):
@@ -65,6 +69,21 @@ def send_verification_code(email, code):
 # U-DISE code validation function
 def is_valid_udise_code(udise_code):
     return len(udise_code) == 13 and udise_code.isdigit()
+
+# Generate a random token
+def generate_token():
+    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(40))
+
+# Function to send the password reset token to user's email
+def send_reset_token(email, token):
+    try:
+        msg = Message("Password Reset Request", recipients=[email])
+        msg.body = f"Your password reset token is {token}. Use this token to reset your password."
+        mail.send(msg)
+    except Exception as e:
+        logging.error(str(e))
+        return False, 500
+    return True, 200
 
 
 @app.route('/signup-step1', methods=['POST'])
@@ -103,8 +122,11 @@ def signup_step1():
         'details_filled': False
     }
 
-    mongo.db.users.insert_one(user)
-
+    try:
+       mongo.db.users.insert_one(user)
+    except errors.DuplicateKeyError:
+       return jsonify({'message': 'Username or Email already exists.'}), 400
+    
     return jsonify({'message': 'Signup successful. Please verify your email.'})
 
 @app.route('/verify-code', methods=['POST'])
@@ -228,13 +250,13 @@ def verify_document_code():
 # User login route
 @app.route('/login', methods=['POST'])
 def login():
-    username = request.form.get('username')
+    email = request.form.get('email')  
     password = request.form.get('password')
 
-    if None in [username, password]:
+    if None in [email, password]:
         return jsonify({'message': 'Missing login information.'}), 400
 
-    user = mongo.db.users.find_one({"username": username})
+    user = mongo.db.users.find_one({"email": email})  # Query user by email
 
     if user and check_password_hash(user['password'], password):
         if user['is_verified']:
@@ -242,8 +264,44 @@ def login():
         else:
             return jsonify({'message': 'Please verify your document to access the dashboard.'}), 403
     else:
-        return jsonify({'message': 'Invalid username or password.'}), 401
+        return jsonify({'message': 'Invalid email or password.'}), 401
 
+
+@app.route('/forgot-password', methods=['POST'])
+def forgot_password():
+    email = request.form.get('email')
+    
+    if not email or not is_valid_email(email):
+        return jsonify({'message': 'Invalid email address.'}), 400
+    
+    user = mongo.db.users.find_one({"email": email})
+    if not user:
+        return jsonify({'message': 'Email does not exist.'}), 400
+
+    reset_token = generate_token()
+    mongo.db.users.update_one({'_id': user['_id']}, {'$set': {'reset_token': reset_token}})
+    
+    send_reset_token(email, reset_token)
+
+    return jsonify({'message': 'Password reset token has been sent to your email.'})
+
+@app.route('/reset-password', methods=['POST'])
+def reset_password():
+    email = request.form.get('email')
+    reset_token = request.form.get('reset_token')
+    new_password = request.form.get('new_password')
+    
+    user = mongo.db.users.find_one({"email": email})
+    if not user:
+        return jsonify({'message': 'Email does not exist.'}), 400
+    
+    if not user.get('reset_token') or user.get('reset_token') != reset_token:
+        return jsonify({'message': 'Invalid reset token.'}), 400
+    
+    hashed_password = generate_password_hash(new_password)
+    mongo.db.users.update_one({'_id': user['_id']}, {'$set': {'password': hashed_password, 'reset_token': None}})
+    
+    return jsonify({'message': 'Password has been reset successfully.'})
 
 # Dashboard route
 @app.route('/dashboard', methods=['GET'])
